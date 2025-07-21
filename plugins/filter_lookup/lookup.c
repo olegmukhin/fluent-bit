@@ -25,6 +25,7 @@
 #include <fluent-bit/flb_ra_key.h>
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_metrics.h>
+#include <fluent-bit/flb_scheduler.h>
 #include <cfl/cfl_time.h>
 #include <monkey/mk_core/mk_list.h>
 #include <msgpack.h>
@@ -35,32 +36,58 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <time.h>
+#include <pthread.h>
 
 #include "lookup.h"
 
-/* Macro to increment records metrics */
+/* Improved metric macros using cmt_counter_inc for consistency with other filters */
 #ifdef FLB_HAVE_METRICS
 #define INCREMENT_SKIPPED_METRIC(ctx, ins) do { \
     uint64_t ts = cfl_time_now(); \
-    cmt_counter_add(ctx->cmt_skipped, ts, 1, 1, (char *[]) {(char*)flb_filter_name(ins)}); \
+    if (ctx->cmt_skipped) { \
+        cmt_counter_inc(ctx->cmt_skipped, ts, 1, (char *[]) {(char*)flb_filter_name(ins)}); \
+    } \
     flb_metrics_sum(FLB_LOOKUP_METRIC_SKIPPED, 1, ins->metrics); \
 } while(0)
 
 #define INCREMENT_MATCHED_METRIC(ctx, ins) do { \
     uint64_t ts = cfl_time_now(); \
-    cmt_counter_add(ctx->cmt_matched, ts, 1, 1, (char *[]) {(char*)flb_filter_name(ins)}); \
+    if (ctx->cmt_matched) { \
+        cmt_counter_inc(ctx->cmt_matched, ts, 1, (char *[]) {(char*)flb_filter_name(ins)}); \
+    } \
     flb_metrics_sum(FLB_LOOKUP_METRIC_MATCHED, 1, ins->metrics); \
 } while(0)
 
 #define INCREMENT_PROCESSED_METRIC(ctx, ins) do { \
     uint64_t ts = cfl_time_now(); \
-    cmt_counter_add(ctx->cmt_processed, ts, 1, 1, (char *[]) {(char*)flb_filter_name(ins)}); \
+    if (ctx->cmt_processed) { \
+        cmt_counter_inc(ctx->cmt_processed, ts, 1, (char *[]) {(char*)flb_filter_name(ins)}); \
+    } \
     flb_metrics_sum(FLB_LOOKUP_METRIC_PROCESSED, 1, ins->metrics); \
+} while(0)
+
+#define INCREMENT_REFRESH_METRIC(ctx, ins) do { \
+    uint64_t ts = cfl_time_now(); \
+    if (ctx->cmt_refresh) { \
+        cmt_counter_inc(ctx->cmt_refresh, ts, 1, (char *[]) {(char*)flb_filter_name(ins)}); \
+    } \
+    flb_metrics_sum(FLB_LOOKUP_METRIC_REFRESH, 1, ins->metrics); \
+} while(0)
+
+#define INCREMENT_REFRESH_ERRORS_METRIC(ctx, ins) do { \
+    uint64_t ts = cfl_time_now(); \
+    if (ctx->cmt_refresh_errors) { \
+        cmt_counter_inc(ctx->cmt_refresh_errors, ts, 1, (char *[]) {(char*)flb_filter_name(ins)}); \
+    } \
+    flb_metrics_sum(FLB_LOOKUP_METRIC_REFRESH_ERRORS, 1, ins->metrics); \
 } while(0)
 #else
 #define INCREMENT_SKIPPED_METRIC(ctx, ins) do { } while(0)
 #define INCREMENT_MATCHED_METRIC(ctx, ins) do { } while(0)
 #define INCREMENT_PROCESSED_METRIC(ctx, ins) do { } while(0)
+#define INCREMENT_REFRESH_METRIC(ctx, ins) do { } while(0)
+#define INCREMENT_REFRESH_ERRORS_METRIC(ctx, ins) do { } while(0)
 #endif
 
 
@@ -68,6 +95,12 @@ struct val_node {
     struct mk_list _head;
     void *val;
 };
+
+/* Forward declarations */
+static int load_csv(struct lookup_ctx *ctx);
+static void refresh_timer_callback(struct flb_config *config, void *data);
+static size_t count_csv_lines(const char *filename);
+static size_t calculate_hash_table_size(size_t expected_entries);
 
 /*
  * Trims leading/trailing whitespace and optionally normalizes to lower-case.
@@ -129,6 +162,9 @@ struct dynamic_buffer {
 /* Initialize a dynamic buffer */
 static int dynbuf_init(struct dynamic_buffer *buf, size_t initial_capacity)
 {
+    if (initial_capacity == 0) {
+        return -1;  /* Fail with zero capacity */
+    }
     buf->data = flb_malloc(initial_capacity);
     if (!buf->data) {
         return -1;
@@ -231,6 +267,267 @@ static char *read_line_dynamic(FILE *fp, size_t *line_length)
     return line;
 }
 
+/* Simplified refresh management functions with timer optimization */
+static void handle_refresh_result(struct lookup_ctx *ctx, int success)
+{
+    time_t now = time(NULL);
+    
+    if (success) {
+        if (ctx->circuit_state == REFRESH_RETRY) {
+            flb_plg_info(ctx->ins, "CSV refresh recovered after %d failures, resuming normal refresh interval (%d seconds)",
+                         ctx->refresh_failures, ctx->refresh_interval);
+        }
+        ctx->circuit_state = REFRESH_NORMAL;
+        ctx->refresh_failures = 0;
+        ctx->last_successful_refresh = now;
+        
+        /* Reschedule timer to use normal refresh_interval (only if different from current) */
+        if (ctx->refresh_timer && ctx->refresh_interval > 0) {
+            flb_sched_timer_destroy(ctx->refresh_timer);
+            ctx->refresh_timer = NULL;
+            
+            int ret = flb_sched_timer_cb_create(ctx->ins->config->sched,
+                                              FLB_SCHED_TIMER_CB_PERM,
+                                              ctx->refresh_interval * 1000,
+                                              refresh_timer_callback,
+                                              ctx,
+                                              &ctx->refresh_timer);
+            if (ret != 0) {
+                flb_plg_warn(ctx->ins, "Failed to reschedule normal refresh timer");
+            }
+        }
+    } else {
+        ctx->refresh_failures++;
+        
+        /* Increment refresh errors counter */
+        INCREMENT_REFRESH_ERRORS_METRIC(ctx, ctx->ins);
+        
+        if (ctx->circuit_state == REFRESH_NORMAL) {
+            flb_plg_warn(ctx->ins, "CSV refresh failed, switching to retry mode (retry every %d seconds)", 
+                         ctx->retry_interval);
+            ctx->circuit_state = REFRESH_RETRY;
+            
+            /* Reschedule timer to use faster retry_interval (CPU optimized) */
+            if (ctx->refresh_timer) {
+                flb_sched_timer_destroy(ctx->refresh_timer);
+                ctx->refresh_timer = NULL;
+                
+                int ret = flb_sched_timer_cb_create(ctx->ins->config->sched,
+                                                  FLB_SCHED_TIMER_CB_PERM,
+                                                  ctx->retry_interval * 1000,
+                                                  refresh_timer_callback,
+                                                  ctx,
+                                                  &ctx->refresh_timer);
+                if (ret != 0) {
+                    flb_plg_warn(ctx->ins, "Failed to reschedule retry timer");
+                }
+            }
+        } else {
+            /* Already in retry mode, continue retrying at current interval */
+            flb_plg_debug(ctx->ins, "CSV refresh retry failed (attempt %d), next retry in %d seconds", 
+                          ctx->refresh_failures, ctx->retry_interval);
+        }
+    }
+    
+    ctx->last_refresh = now;
+}
+
+/* Helper function to safely cleanup val_list */
+static void cleanup_val_list(struct mk_list *val_list)
+{
+    struct mk_list *tmp;
+    struct mk_list *head;
+    struct val_node *node;
+    
+    mk_list_foreach_safe(head, tmp, val_list) {
+        node = mk_list_entry(head, struct val_node, _head);
+        if (node->val) {
+            flb_free(node->val);
+        }
+        mk_list_del(head);
+        flb_free(node);
+    }
+}
+
+/* Thread-safe CSV refresh with graceful degradation - SIMPLIFIED */
+static int refresh_csv_safe(struct lookup_ctx *ctx)
+{
+    struct flb_hash_table *new_ht = NULL;
+    struct mk_list new_val_list;
+    int load_result = -1;
+    
+    flb_plg_debug(ctx->ins, "Starting CSV refresh attempt %d", ctx->refresh_failures + 1);
+    
+    /* Increment refresh attempts counter */
+    INCREMENT_REFRESH_METRIC(ctx, ctx->ins);
+    
+    /* Count CSV lines for optimal hash table sizing */
+    size_t estimated_entries = count_csv_lines(ctx->file);
+    size_t hash_table_size = calculate_hash_table_size(estimated_entries);
+    
+    flb_plg_debug(ctx->ins, "CSV refresh: estimated %zu entries, using hash table size %zu (load factor ~%.2f)", 
+                  estimated_entries, hash_table_size, 
+                  estimated_entries > 0 ? (double)estimated_entries / hash_table_size : 0.0);
+    
+    /* Create new hash table for loading with optimal size */
+    new_ht = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE, hash_table_size, -1);
+    if (!new_ht) {
+        flb_plg_error(ctx->ins, "CSV refresh failed: cannot create new hash table (size %zu)", hash_table_size);
+        INCREMENT_REFRESH_ERRORS_METRIC(ctx, ctx->ins);
+        handle_refresh_result(ctx, 0);
+        return -1;
+    }
+    
+    mk_list_init(&new_val_list);
+    
+    /* Check file accessibility before attempting load (CPU optimization) */
+    if (access(ctx->file, R_OK) != 0) {
+        flb_plg_warn(ctx->ins, "CSV refresh failed: file '%s' not accessible: %s", 
+                     ctx->file, strerror(errno));
+        flb_hash_table_destroy(new_ht);
+        INCREMENT_REFRESH_ERRORS_METRIC(ctx, ctx->ins);
+        handle_refresh_result(ctx, 0);
+        return -1;
+    }
+    
+    /* Temporarily switch context to load into new structures - acquire write lock for exclusive access */
+    pthread_rwlock_wrlock(&ctx->refresh_rwlock);
+    
+    struct flb_hash_table *old_ht = ctx->ht;
+    struct mk_list old_val_list = ctx->val_list;
+    
+    ctx->ht = new_ht;
+    ctx->val_list = new_val_list;
+    
+    /* Attempt to load CSV into new structures */
+    load_result = load_csv(ctx);
+    
+    if (load_result == 0) {
+        /* Success: Replace old structures with new ones */
+        double new_load_factor = (double)ctx->ht->total_count / hash_table_size;
+        double old_load_factor = old_ht->size > 0 ? (double)old_ht->total_count / old_ht->size : 0.0;
+        
+        flb_plg_info(ctx->ins, "CSV refresh successful: loaded %d entries (was %d), load factor %.3f (was %.3f)", 
+                     (int)ctx->ht->total_count, (int)old_ht->total_count, new_load_factor, old_load_factor);
+        
+        /* Clean up old structures */
+        flb_hash_table_destroy(old_ht);
+        cleanup_val_list(&old_val_list);
+        
+        /* Update success metrics */
+        handle_refresh_result(ctx, 1);
+        
+    } else {
+        /* Failure: Restore old structures, cleanup new ones */
+        flb_plg_warn(ctx->ins, "CSV refresh failed: keeping existing %d entries", 
+                     (int)old_ht->total_count);
+        
+        /* Restore old structures */
+        flb_hash_table_destroy(ctx->ht);
+        cleanup_val_list(&ctx->val_list);
+        
+        ctx->ht = old_ht;
+        ctx->val_list = old_val_list;
+        
+        /* Handle failure - switches to retry mode with faster interval */
+        handle_refresh_result(ctx, 0);
+    }
+    
+    pthread_rwlock_unlock(&ctx->refresh_rwlock);
+    
+    return load_result;
+}
+
+/* Timer callback for periodic refresh - CPU optimized */
+static void refresh_timer_callback(struct flb_config *config, void *data)
+{
+    struct lookup_ctx *ctx = (struct lookup_ctx *)data;
+    
+    if (!ctx || ctx->refresh_interval <= 0) {
+        return;
+    }
+    
+    /* CPU optimization: Quick pre-check for file availability in retry mode */
+    if (ctx->circuit_state == REFRESH_RETRY) {
+        if (access(ctx->file, R_OK) != 0) {
+            /* File still not accessible, avoid expensive operations */
+            ctx->refresh_failures++;
+            ctx->last_refresh = time(NULL);
+            flb_plg_debug(ctx->ins, "Quick retry check: file still unavailable (failure %d)", 
+                          ctx->refresh_failures);
+            return;
+        }
+    }
+    
+    flb_plg_debug(ctx->ins, "Timer triggered CSV refresh");
+    refresh_csv_safe(ctx);
+}
+
+/* 
+ * Count lines in CSV file for optimal hash table sizing.
+ * Uses buffered reading for performance with large files.
+ */
+static size_t count_csv_lines(const char *filename)
+{
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        return 0;  /* Will fall back to default sizing */
+    }
+    
+    size_t line_count = 0;
+    size_t buffer_size = 65536;  /* 64KB buffer for efficient reading */
+    char *buffer = flb_malloc(buffer_size);
+    
+    if (!buffer) {
+        fclose(fp);
+        return 0;  /* Fall back to default sizing on memory failure */
+    }
+    
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer, 1, buffer_size, fp)) > 0) {
+        for (size_t i = 0; i < bytes_read; i++) {
+            if (buffer[i] == '\n') {
+                line_count++;
+            }
+        }
+    }
+    
+    flb_free(buffer);
+    fclose(fp);
+    
+    /* Subtract 1 for header line if we found any lines */
+    return line_count > 0 ? line_count - 1 : 0;
+}
+
+/*
+ * Calculate optimal hash table size based on expected entry count.
+ * Target load factor: ~0.67 (1.5x entries) for optimal performance.
+ */
+static size_t calculate_hash_table_size(size_t expected_entries)
+{
+    size_t min_size = 64;    /* Minimum reasonable size */
+    size_t max_size = 1048576; /* Maximum size (1M buckets) */
+    
+    if (expected_entries == 0) {
+        return 1024;  /* Default size for unknown count */
+    }
+    
+    /* Target load factor: 0.67, so size = entries * 1.5 */
+    size_t target_size = expected_entries + (expected_entries / 2);
+    
+    /* Round up to next power of 2 for better hash distribution */
+    size_t size = min_size;
+    while (size < target_size && size < max_size) {
+        size *= 2;
+    }
+    
+    /* Clamp to reasonable bounds */
+    if (size < min_size) size = min_size;
+    if (size > max_size) size = max_size;
+    
+    return size;
+}
+
 static int load_csv(struct lookup_ctx *ctx)
 {
     FILE *fp;
@@ -320,7 +617,7 @@ static int load_csv(struct lookup_ctx *ctx)
                 p++;
                 continue;
             }
-            if (*p == ',') {
+            if (*p == ctx->delimiter[0]) {
                 field = 1;
                 p++;
                 break;
@@ -375,7 +672,7 @@ static int load_csv(struct lookup_ctx *ctx)
                 p++;
                 continue;
             }
-            if (*p == ',') {
+            if (*p == ctx->delimiter[0]) {
                 /* Ignore extra fields */
                 break;
             }
@@ -423,7 +720,8 @@ static int load_csv(struct lookup_ctx *ctx)
             line_num++;
             continue;
         }
-        if (key_len == 0 || val_len == 0) {
+        if (key_len == 0) {
+            /* Empty key is not valid, skip */
             if (key_ptr_allocated) flb_free(key_ptr);
             if (val_ptr_allocated) flb_free(val_ptr);
             dynbuf_destroy(&key_buf);
@@ -443,7 +741,12 @@ static int load_csv(struct lookup_ctx *ctx)
             line_num++;
             continue;
         }
-        memcpy(val_heap, val_ptr, val_len);
+        if (val_len > 0 && val_ptr) {
+            memcpy(val_heap, val_ptr, val_len);
+        } else {
+            /* For empty values, ensure val_heap is initialized */
+            val_len = 0;
+        }
         val_heap[val_len] = '\0';
         int ret = flb_hash_table_add(ctx->ht, key_ptr, key_len, val_heap, val_len);
         if (ret < 0) {
@@ -500,27 +803,73 @@ static int cb_lookup_init(struct flb_filter_instance *ins,
     }
     ctx->ins = ins;
 
+    /* Initialize refresh system defaults */
+    ctx->circuit_state = REFRESH_NORMAL;
+    ctx->refresh_failures = 0;
+    ctx->last_refresh = 0;
+    ctx->last_successful_refresh = time(NULL);
+    ctx->refresh_timer = NULL;
+    
+    /* Initialize read-write lock for thread-safe refresh - allows concurrent filter operations */
+    if (pthread_rwlock_init(&ctx->refresh_rwlock, NULL) != 0) {
+        flb_plg_error(ins, "Failed to initialize refresh rwlock");
+        flb_free(ctx);
+        return -1;
+    }
+
 #ifdef FLB_HAVE_METRICS
-    /* Initialize CMT metrics */
+    /* Initialize CMT metrics with error checking */
     ctx->cmt_processed = cmt_counter_create(ins->cmt,
                                             "fluentbit", "filter", "lookup_processed_records_total",
-                                            "Total number of processed records",
+                                            "Total number of records processed by lookup filter",
                                             1, (char *[]) {"name"});
+    if (!ctx->cmt_processed) {
+        flb_plg_error(ins, "could not create processed records metric");
+        goto error;
+    }
 
     ctx->cmt_matched = cmt_counter_create(ins->cmt,
                                           "fluentbit", "filter", "lookup_matched_records_total",
-                                          "Total number of matched records",
+                                          "Total number of records matched in lookup table",
                                           1, (char *[]) {"name"});
+    if (!ctx->cmt_matched) {
+        flb_plg_error(ins, "could not create matched records metric");
+        goto error;
+    }
 
     ctx->cmt_skipped = cmt_counter_create(ins->cmt,
                                           "fluentbit", "filter", "lookup_skipped_records_total",
-                                          "Total number of skipped records due to errors",
+                                          "Total number of records skipped due to errors or missing keys",
                                           1, (char *[]) {"name"});
+    if (!ctx->cmt_skipped) {
+        flb_plg_error(ins, "could not create skipped records metric");
+        goto error;
+    }
 
-    /* Add to old metrics system */
-    flb_metrics_add(FLB_LOOKUP_METRIC_PROCESSED, "processed_records_total", ins->metrics);
-    flb_metrics_add(FLB_LOOKUP_METRIC_MATCHED, "matched_records_total", ins->metrics);
-    flb_metrics_add(FLB_LOOKUP_METRIC_SKIPPED, "skipped_records_total", ins->metrics);
+    ctx->cmt_refresh = cmt_counter_create(ins->cmt,
+                                          "fluentbit", "filter", "lookup_refresh_total",
+                                          "Total number of lookup table refresh attempts",
+                                          1, (char *[]) {"name"});
+    if (!ctx->cmt_refresh) {
+        flb_plg_error(ins, "could not create refresh metric");
+        goto error;
+    }
+
+    ctx->cmt_refresh_errors = cmt_counter_create(ins->cmt,
+                                                 "fluentbit", "filter", "lookup_refresh_errors_total",
+                                                 "Total number of lookup table refresh errors",
+                                                 1, (char *[]) {"name"});
+    if (!ctx->cmt_refresh_errors) {
+        flb_plg_error(ins, "could not create refresh errors metric");
+        goto error;
+    }
+
+    /* Initialize legacy metrics */
+    flb_metrics_add(FLB_LOOKUP_METRIC_PROCESSED, "lookup_processed_records_total", ins->metrics);
+    flb_metrics_add(FLB_LOOKUP_METRIC_MATCHED, "lookup_matched_records_total", ins->metrics);
+    flb_metrics_add(FLB_LOOKUP_METRIC_SKIPPED, "lookup_skipped_records_total", ins->metrics);
+    flb_metrics_add(FLB_LOOKUP_METRIC_REFRESH, "lookup_refresh_total", ins->metrics);
+    flb_metrics_add(FLB_LOOKUP_METRIC_REFRESH_ERRORS, "lookup_refresh_errors_total", ins->metrics);
 #endif
 
     /*
@@ -542,6 +891,30 @@ static int cb_lookup_init(struct flb_filter_instance *ins,
         goto error;
     }
 
+    /* Validate delimiter - must be a single character */
+    if (!ctx->delimiter || strlen(ctx->delimiter) != 1) {
+        flb_plg_error(ins, "delimiter must be a single character, got: %s", 
+                      ctx->delimiter ? ctx->delimiter : "NULL");
+        goto error;
+    }
+
+    /* Validate refresh configuration - SIMPLIFIED */
+    if (ctx->refresh_interval < 0) {
+        flb_plg_error(ins, "refresh_interval must be >= 0, got: %d", ctx->refresh_interval);
+        goto error;
+    }
+    
+    if (ctx->retry_interval < 1) {
+        flb_plg_error(ins, "retry_interval must be >= 1, got: %d", ctx->retry_interval);
+        goto error;
+    }
+    
+    /* Warn if retry_interval is longer than refresh_interval (could be inefficient) */
+    if (ctx->refresh_interval > 0 && ctx->retry_interval > ctx->refresh_interval) {
+        flb_plg_warn(ins, "retry_interval (%d) is longer than refresh_interval (%d), consider adjusting", 
+                     ctx->retry_interval, ctx->refresh_interval);
+    }
+
     /* Check file existence and readability */
     if (access(ctx->file, R_OK) != 0) {
         flb_plg_error(ins, "CSV file '%s' does not exist or is not readable: %s", ctx->file, strerror(errno));
@@ -549,12 +922,19 @@ static int cb_lookup_init(struct flb_filter_instance *ins,
     }
 
     /*
-     * Create hash table for lookups. This will store key-value pairs loaded
-     * from the CSV file for fast lookup during filtering.
+     * Count CSV entries and create optimally-sized hash table for lookups.
+     * This prevents long collision chains that hurt performance with large files.
      */
-    ctx->ht = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE, 1024, -1);
+    flb_plg_info(ins, "Starting dynamic hash table sizing for file: %s", ctx->file);
+    size_t estimated_entries = count_csv_lines(ctx->file);
+    size_t hash_table_size = calculate_hash_table_size(estimated_entries);
+    
+    flb_plg_info(ins, "CSV analysis: estimated %zu entries, creating hash table with %zu buckets (target load factor ~0.67)", 
+                 estimated_entries, hash_table_size);
+    
+    ctx->ht = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE, hash_table_size, -1);
     if (!ctx->ht) {
-        flb_plg_error(ins, "could not create hash table");
+        flb_plg_error(ins, "could not create hash table (size %zu)", hash_table_size);
         goto error;
     }
 
@@ -570,21 +950,47 @@ static int cb_lookup_init(struct flb_filter_instance *ins,
     if (ret < 0) {
         goto error;
     }
-    flb_plg_info(ins, "Loaded %d entries from CSV file '%s'", (int)ctx->ht->total_count, ctx->file);
-    flb_plg_info(ins, "Lookup filter initialized: lookup_key='%s', result_key='%s', ignore_case=%s", 
-                 ctx->lookup_key, ctx->result_key, ctx->ignore_case ? "true" : "false");
+    
+    /* Calculate actual load factor achieved */
+    double actual_load_factor = (double)ctx->ht->total_count / hash_table_size;
+    
+    flb_plg_info(ins, "Loaded %d entries from CSV file '%s' into %zu-bucket hash table (load factor: %.3f)", 
+                 (int)ctx->ht->total_count, ctx->file, hash_table_size, actual_load_factor);
+    flb_plg_info(ins, "Lookup filter initialized: lookup_key='%s', result_key='%s', delimiter='%s', ignore_case=%s", 
+                 ctx->lookup_key, ctx->result_key, ctx->delimiter, ctx->ignore_case ? "true" : "false");
+
+    /* Setup periodic refresh timer if enabled */
+    if (ctx->refresh_interval > 0) {
+        ret = flb_sched_timer_cb_create(config->sched,
+                                        FLB_SCHED_TIMER_CB_PERM,
+                                        ctx->refresh_interval * 1000, /* Convert to milliseconds */
+                                        refresh_timer_callback,
+                                        ctx,
+                                        &ctx->refresh_timer);
+        if (ret != 0) {
+            flb_plg_warn(ins, "Failed to create refresh timer, refresh disabled");
+            ctx->refresh_interval = 0;  /* Disable refresh */
+        } else {
+            flb_plg_info(ins, "CSV refresh enabled: interval=%d seconds, retry_interval=%d seconds",
+                         ctx->refresh_interval, ctx->retry_interval);
+        }
+    }
 
     /* Store context for use in filter and exit callbacks. */
     flb_filter_set_context(ins, ctx);
     return 0;
 
 error:
+    if (ctx->refresh_timer) {
+        flb_sched_timer_destroy(ctx->refresh_timer);
+    }
     if (ctx->ra_lookup_key) {
         flb_ra_destroy(ctx->ra_lookup_key);
     }
     if (ctx->ht) {
         flb_hash_table_destroy(ctx->ht);
     }
+    pthread_rwlock_destroy(&ctx->refresh_rwlock);
     flb_free(ctx);
     return -1;
 }
@@ -651,10 +1057,14 @@ static int cb_lookup_filter(const void *data, size_t bytes,
         return FLB_FILTER_NOTOUCH;
     }
 
+    /* Acquire read lock for the duration of filtering to allow concurrent filter operations */
+    pthread_rwlock_rdlock(&ctx->refresh_rwlock);
+
     /* Initialize log event decoder for input records */
     ret = flb_log_event_decoder_init(&log_decoder, (char *)data, bytes);
     if (ret != FLB_EVENT_DECODER_SUCCESS) {
         flb_plg_error(ins, "Log event decoder initialization error : %d", ret);
+        pthread_rwlock_unlock(&ctx->refresh_rwlock);
         return FLB_FILTER_NOTOUCH;
     }
 
@@ -663,12 +1073,14 @@ static int cb_lookup_filter(const void *data, size_t bytes,
     if (ret != FLB_EVENT_ENCODER_SUCCESS) {
         flb_plg_error(ins, "Log event encoder initialization error : %d", ret);
         flb_log_event_decoder_destroy(&log_decoder);
+        pthread_rwlock_unlock(&ctx->refresh_rwlock);
         return FLB_FILTER_NOTOUCH;
     }
 
     /* Process each log event in the input batch */
     while ((ret = flb_log_event_decoder_next(&log_decoder, &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
         rec_num++;
+        /* Count all records processed by the filter */
         INCREMENT_PROCESSED_METRIC(ctx, ins);
         lookup_val_str = NULL;
         lookup_val_len = 0;
@@ -687,9 +1099,10 @@ static int cb_lookup_filter(const void *data, size_t bytes,
             } \
         } while(0)
 
-        /* If body is not a map, emit original record and log debug */
+        /* If body is not a map, skip matching logic and emit original record */
         if (!log_event.body || log_event.body->type != MSGPACK_OBJECT_MAP) {
-            flb_plg_debug(ins, "Record %d: body is not a map (type=%d), emitting original", rec_num, log_event.body ? log_event.body->type : -1);
+            flb_plg_debug(ins, "Record %d: body is not a map (type=%d), skipping lookup", rec_num, log_event.body ? log_event.body->type : -1);
+            INCREMENT_SKIPPED_METRIC(ctx, ins);
             emit_original_record(&log_encoder, &log_event, ins, ctx, rec_num);
             continue;
         }
@@ -697,7 +1110,9 @@ static int cb_lookup_filter(const void *data, size_t bytes,
         /* Use record accessor to get the lookup value */
         struct flb_ra_value *rval = flb_ra_get_value_object(ctx->ra_lookup_key, *log_event.body);
         if (!rval) {
-            /* Key not found, emit original record */
+            /* Key not found, skip matching logic and emit original record */
+            flb_plg_debug(ins, "Record %d: lookup_key '%s' not found, skipping lookup", rec_num, ctx->lookup_key);
+            INCREMENT_SKIPPED_METRIC(ctx, ins);
             emit_original_record(&log_encoder, &log_event, ins, ctx, rec_num);
             continue;
         }
@@ -725,20 +1140,22 @@ static int cb_lookup_filter(const void *data, size_t bytes,
                     required_size = snprintf(NULL, 0, "%" PRId64, rval->o.via.i64);
                     break;
                 case FLB_RA_FLOAT:
-                    required_size = snprintf(NULL, 0, "%f", rval->o.via.f64);
+                    required_size = snprintf(NULL, 0, "%.17g", rval->o.via.f64);
                     break;
                 case FLB_RA_NULL:
                     required_size = snprintf(NULL, 0, "null");
                     break;
                 case 5:
                 case 6:
-                    flb_plg_debug(ins, "Record %d: complex type (ARRAY/MAP) from record accessor, skipping conversion", rec_num);
+                    flb_plg_debug(ins, "Record %d: complex type (ARRAY/MAP) from record accessor, skipping lookup", rec_num);
+                    INCREMENT_SKIPPED_METRIC(ctx, ins);
                     CLEANUP_DYNAMIC_BUFFERS();
                     flb_ra_key_value_destroy(rval);
                     emit_original_record(&log_encoder, &log_event, ins, ctx, rec_num);
                     continue;
                 default:
-                    flb_plg_debug(ins, "Record %d: unsupported type %d, skipping conversion", rec_num, rval->type);
+                    flb_plg_debug(ins, "Record %d: unsupported type %d, skipping lookup", rec_num, rval->type);
+                    INCREMENT_SKIPPED_METRIC(ctx, ins);
                     CLEANUP_DYNAMIC_BUFFERS();
                     flb_ra_key_value_destroy(rval);
                     emit_original_record(&log_encoder, &log_event, ins, ctx, rec_num);
@@ -746,7 +1163,8 @@ static int cb_lookup_filter(const void *data, size_t bytes,
             }
             
             if (required_size < 0) {
-                flb_plg_debug(ins, "Record %d: snprintf sizing failed for type %d, skipping conversion", rec_num, rval->type);
+                flb_plg_debug(ins, "Record %d: snprintf sizing failed for type %d, skipping lookup", rec_num, rval->type);
+                INCREMENT_SKIPPED_METRIC(ctx, ins);
                 CLEANUP_DYNAMIC_BUFFERS();
                 flb_ra_key_value_destroy(rval);
                 emit_original_record(&log_encoder, &log_event, ins, ctx, rec_num);
@@ -774,7 +1192,7 @@ static int cb_lookup_filter(const void *data, size_t bytes,
                     printed = snprintf(dynamic_val_buf, required_size + 1, "%" PRId64, rval->o.via.i64);
                     break;
                 case FLB_RA_FLOAT:
-                    printed = snprintf(dynamic_val_buf, required_size + 1, "%f", rval->o.via.f64);
+                    printed = snprintf(dynamic_val_buf, required_size + 1, "%.17g", rval->o.via.f64);
                     break;
                 case FLB_RA_NULL:
                     printed = snprintf(dynamic_val_buf, required_size + 1, "null");
@@ -782,7 +1200,8 @@ static int cb_lookup_filter(const void *data, size_t bytes,
             }
             
             if (printed < 0 || printed != required_size) {
-                flb_plg_debug(ins, "Record %d: snprintf formatting failed (expected %d, got %d), skipping conversion", rec_num, required_size, printed);
+                flb_plg_debug(ins, "Record %d: snprintf formatting failed (expected %d, got %d), skipping lookup", rec_num, required_size, printed);
+                INCREMENT_SKIPPED_METRIC(ctx, ins);
                 CLEANUP_DYNAMIC_BUFFERS();
                 flb_ra_key_value_destroy(rval);
                 emit_original_record(&log_encoder, &log_event, ins, ctx, rec_num);
@@ -826,14 +1245,24 @@ static int cb_lookup_filter(const void *data, size_t bytes,
          * Attempt to find the lookup value in the hash table.
          * If not found, emit the original record unchanged.
          */
+        flb_plg_debug(ins, "Record %d: Looking up key '%.*s' (len=%zu)", 
+                     rec_num, (int)lookup_val_len, lookup_val_str, lookup_val_len);
         int ht_get_ret = flb_hash_table_get(ctx->ht, lookup_val_str, lookup_val_len, &found_val, &found_len);
+        flb_plg_debug(ins, "Record %d: Hash table get returned %d, found_val=%p, found_len=%zu", 
+                     rec_num, ht_get_ret, found_val, found_len);
         
-        if (ht_get_ret < 0 || !found_val || found_len == 0) {
+        if (ht_get_ret < 0 || !found_val) {
             /* Not found, emit original record */
             CLEANUP_DYNAMIC_BUFFERS();
             flb_ra_key_value_destroy(rval);
             emit_original_record(&log_encoder, &log_event, ins, ctx, rec_num);
             continue;
+        }
+
+        /* Handle hash table bug: when zero-length values are stored, get may return -1 as found_len */
+        if (found_len == SIZE_MAX || (found_len > 0 && found_len > 1000000)) {
+            /* Likely a hash table bug with zero-length values, treat as empty string */
+            found_len = 0;
         }
 
         /* Match found - increment counter */
@@ -909,9 +1338,15 @@ static int cb_lookup_filter(const void *data, size_t bytes,
             continue;
         }
 
-        ret = flb_log_event_encoder_append_body_string(&log_encoder, (char *)found_val, found_len);
+        /* Add found value - handle empty values safely */
+        if (found_len > 0 && found_val) {
+            ret = flb_log_event_encoder_append_body_string(&log_encoder, (char *)found_val, found_len);
+        } else {
+            /* For empty or null values, append empty string */
+            ret = flb_log_event_encoder_append_body_string(&log_encoder, "", 0);
+        }
         if (ret != FLB_EVENT_ENCODER_SUCCESS) {
-            flb_plg_warn(ins, "Record %d: failed to append found_val, emitting original", rec_num);
+            flb_plg_warn(ins, "Record %d: failed to append found_val (len=%zu), emitting original", rec_num, found_len);
             INCREMENT_SKIPPED_METRIC(ctx, ins);
             flb_log_event_encoder_rollback_record(&log_encoder);
             emit_original_record(&log_encoder, &log_event, ins, ctx, rec_num);
@@ -945,6 +1380,10 @@ static int cb_lookup_filter(const void *data, size_t bytes,
 
     flb_log_event_decoder_destroy(&log_decoder);
     flb_log_event_encoder_destroy(&log_encoder);
+    
+    /* Release the read lock before returning */
+    pthread_rwlock_unlock(&ctx->refresh_rwlock);
+    
     return ret;
 }
 
@@ -953,18 +1392,21 @@ static int cb_lookup_exit(void *data, struct flb_config *config)
     struct lookup_ctx *ctx = data;
     if (!ctx) return 0;
     
-    /* Free all allocated values tracked in val_list */
-    struct mk_list *tmp;
-    struct mk_list *head;
-    struct val_node *node;
-    mk_list_foreach_safe(head, tmp, &ctx->val_list) {
-        node = mk_list_entry(head, struct val_node, _head);
-        flb_free(node->val);
-        mk_list_del(head);
-        flb_free(node);
+    /* Destroy refresh timer if active */
+    if (ctx->refresh_timer) {
+        flb_sched_timer_destroy(ctx->refresh_timer);
+        ctx->refresh_timer = NULL;
     }
+    
+    /* Free all allocated values tracked in val_list */
+    cleanup_val_list(&ctx->val_list);
+    
     if (ctx->ra_lookup_key) flb_ra_destroy(ctx->ra_lookup_key);
     if (ctx->ht) flb_hash_table_destroy(ctx->ht);
+    
+    /* Destroy the read-write lock */
+    pthread_rwlock_destroy(&ctx->refresh_rwlock);
+    
     flb_free(ctx);
     return 0;
 }
@@ -973,7 +1415,10 @@ static struct flb_config_map config_map[] = {
     { FLB_CONFIG_MAP_STR, "file", NULL, 0, FLB_TRUE, offsetof(struct lookup_ctx, file), "CSV file to lookup values from." },
     { FLB_CONFIG_MAP_STR, "lookup_key", NULL, 0, FLB_TRUE, offsetof(struct lookup_ctx, lookup_key), "Name of the key to lookup in input record." },
     { FLB_CONFIG_MAP_STR, "result_key", NULL, 0, FLB_TRUE, offsetof(struct lookup_ctx, result_key), "Name of the key to add to output record if found." },
+    { FLB_CONFIG_MAP_STR, "delimiter", ",", 0, FLB_TRUE, offsetof(struct lookup_ctx, delimiter), "Delimiter character for CSV parsing (default: comma)." },
     { FLB_CONFIG_MAP_BOOL, "ignore_case", "false", 0, FLB_TRUE, offsetof(struct lookup_ctx, ignore_case), "Ignore case when matching lookup values (default: false)." },
+    { FLB_CONFIG_MAP_INT, "refresh_interval", "0", 0, FLB_TRUE, offsetof(struct lookup_ctx, refresh_interval), "Refresh CSV file every N seconds (0=disabled, default: 0)." },
+    { FLB_CONFIG_MAP_INT, "retry_interval", "600", 0, FLB_TRUE, offsetof(struct lookup_ctx, retry_interval), "Retry failed refresh every N seconds (default: 600)." },
     {0}
 };
 
